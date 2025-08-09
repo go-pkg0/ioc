@@ -1,6 +1,8 @@
 package ioc
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 )
@@ -9,6 +11,8 @@ import (
 var _ Container = (*container)(nil)
 
 // singletonEntry 使用 sync.Once 保证单例工厂仅执行一次。
+// 工厂错误会被永久缓存，避免并发重试导致的竞态问题。
+// 如需重试，请调用 Remove 后重新注册。
 type singletonEntry struct {
 	once sync.Once
 	val  any
@@ -19,11 +23,11 @@ type singletonEntry struct {
 type container struct {
 	mu          sync.RWMutex
 	bindings    map[string]binding
-	singletons  map[string]any              // 已就绪的单例缓存
-	pending     map[string]*singletonEntry  // 正在创建的单例（per-key Once）
-	order       []string                    // 单例创建顺序（Shutdown 反序关闭用）
-	decorators  map[string][]Decorator      // 服务级装饰器
-	middlewares []Middleware                 // 全局中间件
+	singletons  map[string]any             // 已就绪的单例缓存
+	pending     map[string]*singletonEntry // 正在创建或已失败的单例
+	order       []string                   // 单例创建顺序（Close 反序关闭用）
+	decorators  map[string][]Decorator     // 服务级装饰器
+	middlewares []Middleware               // 全局中间件
 }
 
 // New 创建一个空的 Container。
@@ -48,8 +52,9 @@ func (c *container) Singleton(abstract string, factory Factory) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.bindings[abstract] = binding{factory: factory, singleton: true}
-	// 清除旧的 pending entry（重新注册场景）。
+	// 清除旧的缓存（重新注册场景）。
 	delete(c.pending, abstract)
+	delete(c.singletons, abstract)
 }
 
 // Instance 直接注册已构建的实例为单例。
@@ -62,7 +67,7 @@ func (c *container) Instance(abstract string, value any) {
 }
 
 // Make 按名称解析服务实例。
-func (c *container) Make(abstract string) (any, error) {
+func (c *container) Make(ctx context.Context, abstract string) (any, error) {
 	// 快路径：单例缓存命中，直接返回（零分配，不经过中间件/装饰器）。
 	c.mu.RLock()
 	if val, ok := c.singletons[abstract]; ok {
@@ -84,14 +89,14 @@ func (c *container) Make(abstract string) (any, error) {
 	}
 
 	// 构建解析函数：工厂 → 装饰器链。
-	resolve := func() (any, error) {
-		val, err := b.factory(c)
+	resolve := func(ctx context.Context) (any, error) {
+		val, err := b.factory(ctx, c)
 		if err != nil {
 			return nil, err
 		}
 		// 按注册顺序执行装饰器（管道模型）。
 		for _, dec := range decs {
-			val, err = dec(val, c)
+			val, err = dec(ctx, val, c)
 			if err != nil {
 				return nil, err
 			}
@@ -106,11 +111,10 @@ func (c *container) Make(abstract string) (any, error) {
 
 	// 瞬时绑定：每次创建新实例。
 	if !b.singleton {
-		return resolve()
+		return resolve(ctx)
 	}
 
 	// 单例路径：使用 per-key sync.Once 保证工厂仅执行一次。
-	// 获取或创建 singletonEntry。
 	c.mu.Lock()
 	// 二次检查：可能在等待锁期间已被其他 goroutine 创建。
 	if val, ok := c.singletons[abstract]; ok {
@@ -126,16 +130,12 @@ func (c *container) Make(abstract string) (any, error) {
 
 	// sync.Once 保证 resolve 只执行一次，且在锁外执行（避免死锁）。
 	entry.once.Do(func() {
-		entry.val, entry.err = resolve()
+		entry.val, entry.err = resolve(ctx)
 	})
 
+	// 工厂错误被永久缓存，不清除 entry，避免并发竞态。
+	// 如需重试，调用 Remove 后重新 Singleton 注册。
 	if entry.err != nil {
-		// 工厂出错：清除 pending entry，允许重试。
-		c.mu.Lock()
-		if c.pending[abstract] == entry {
-			delete(c.pending, abstract)
-		}
-		c.mu.Unlock()
 		return nil, entry.err
 	}
 
@@ -152,8 +152,8 @@ func (c *container) Make(abstract string) (any, error) {
 }
 
 // MustMake 解析服务实例，失败时 panic。
-func (c *container) MustMake(abstract string) any {
-	val, err := c.Make(abstract)
+func (c *container) MustMake(ctx context.Context, abstract string) any {
+	val, err := c.Make(ctx, abstract)
 	if err != nil {
 		panic(err)
 	}
@@ -182,6 +182,52 @@ func (c *container) Use(middleware ...Middleware) {
 	c.middlewares = append(c.middlewares, middleware...)
 }
 
+// Close 优雅关闭所有实现了 Closeable 接口的单例。
+// 按创建的逆序执行 Close，确保依赖关系正确释放。
+func (c *container) Close(ctx context.Context) error {
+	c.mu.RLock()
+	order := make([]string, len(c.order))
+	copy(order, c.order)
+	singletons := make(map[string]any, len(c.singletons))
+	for k, v := range c.singletons {
+		singletons[k] = v
+	}
+	c.mu.RUnlock()
+
+	var errs []error
+	for i := len(order) - 1; i >= 0; i-- {
+		name := order[i]
+		val, exists := singletons[name]
+		if !exists {
+			continue
+		}
+		if closeable, ok := val.(Closeable); ok {
+			if err := closeable.Close(ctx); err != nil {
+				errs = append(errs, fmt.Errorf("ioc: close %q: %w", name, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// HealthCheck 对所有实现了 HealthChecker 接口的单例执行健康检查。
+func (c *container) HealthCheck(ctx context.Context) map[string]error {
+	c.mu.RLock()
+	singletons := make(map[string]any, len(c.singletons))
+	for k, v := range c.singletons {
+		singletons[k] = v
+	}
+	c.mu.RUnlock()
+
+	result := make(map[string]error)
+	for name, val := range singletons {
+		if checker, ok := val.(HealthChecker); ok {
+			result[name] = checker.Health(ctx)
+		}
+	}
+	return result
+}
+
 // Remove 删除指定名称的绑定及其缓存。
 func (c *container) Remove(abstract string) {
 	c.mu.Lock()
@@ -190,7 +236,6 @@ func (c *container) Remove(abstract string) {
 	delete(c.singletons, abstract)
 	delete(c.decorators, abstract)
 	delete(c.pending, abstract)
-	// 从 order 中移除
 	c.removeFromOrder(abstract)
 }
 
@@ -225,26 +270,6 @@ func (c *container) Flush() {
 	c.decorators = make(map[string][]Decorator)
 	c.middlewares = nil
 	c.order = nil
-}
-
-// Order 返回单例创建顺序（用于 Application 反序关闭）。
-func (c *container) Order() []string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	out := make([]string, len(c.order))
-	copy(out, c.order)
-	return out
-}
-
-// Singletons 返回所有已缓存的单例快照（用于 Application 健康检查等）。
-func (c *container) Singletons() map[string]any {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	out := make(map[string]any, len(c.singletons))
-	for k, v := range c.singletons {
-		out[k] = v
-	}
-	return out
 }
 
 // copySlice 安全拷贝切片元素，防止并发 append 修改 backing array。

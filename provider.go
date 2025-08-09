@@ -1,5 +1,7 @@
 package ioc
 
+import "context"
+
 // ServiceProvider 定义服务提供者的两阶段生命周期。
 //
 // 所有模块（log、db、cache、es、mongo 等）的 Provider 必须实现此接口。
@@ -9,6 +11,7 @@ package ioc
 //     该阶段仅绑定工厂函数到容器，禁止解析其他 Provider 注册的依赖。
 //  2. Boot — 所有 Provider 完成 Register 后，依次执行 Boot。
 //     该阶段允许解析依赖并执行初始化逻辑。
+//     ctx 用于控制 Boot 超时和链路追踪。
 //
 // 示例:
 //
@@ -16,20 +19,20 @@ package ioc
 //
 //	func (p *LogServiceProvider) Register(c ioc.Container) error {
 //	    cfg := p.Config
-//	    c.Singleton("log", func(c ioc.Container) (any, error) {
+//	    c.Singleton("log", func(ctx context.Context, c ioc.Container) (any, error) {
 //	        return log.NewManager(cfg)
 //	    })
 //	    return nil
 //	}
 //
-//	func (p *LogServiceProvider) Boot(c ioc.Container) error {
-//	    mgr := ioc.MustMakeTyped[*log.Manager](c, "log")
+//	func (p *LogServiceProvider) Boot(ctx context.Context, c ioc.Container) error {
+//	    mgr := ioc.MustMakeTyped[*log.Manager](ctx, c, "log")
 //	    log.SetDefault(mgr)
 //	    return nil
 //	}
 type ServiceProvider interface {
 	Register(c Container) error
-	Boot(c Container) error
+	Boot(ctx context.Context, c Container) error
 }
 
 // DeferrableProvider 是可选接口，用于标记延迟初始化的服务提供者。

@@ -22,7 +22,7 @@ func (p *trackingProvider) Register(c Container) error {
 	return nil
 }
 
-func (p *trackingProvider) Boot(c Container) error {
+func (p *trackingProvider) Boot(_ context.Context, c Container) error {
 	p.tracker.log = append(p.tracker.log, p.name+":boot")
 	return nil
 }
@@ -36,13 +36,13 @@ type deferredProvider struct {
 
 func (p *deferredProvider) Register(c Container) error {
 	p.tracker.log = append(p.tracker.log, p.name+":register")
-	c.Singleton(p.name, func(_ Container) (any, error) {
+	c.Singleton(p.name, func(_ context.Context, _ Container) (any, error) {
 		return "deferred-value", nil
 	})
 	return nil
 }
 
-func (p *deferredProvider) Boot(c Container) error {
+func (p *deferredProvider) Boot(_ context.Context, c Container) error {
 	p.tracker.log = append(p.tracker.log, p.name+":boot")
 	return nil
 }
@@ -84,6 +84,7 @@ func (s *unhealthyService) Health(_ context.Context) error {
 // --- Tests ---
 
 func TestApplicationBootOrder(t *testing.T) {
+	ctx := context.Background()
 	tracker := &orderTracker{}
 	app := NewApp()
 	app.Register(
@@ -92,7 +93,7 @@ func TestApplicationBootOrder(t *testing.T) {
 		&trackingProvider{name: "cache", tracker: tracker},
 	)
 
-	if err := app.Boot(); err != nil {
+	if err := app.Boot(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -111,12 +112,13 @@ func TestApplicationBootOrder(t *testing.T) {
 }
 
 func TestApplicationBootIdempotent(t *testing.T) {
+	ctx := context.Background()
 	tracker := &orderTracker{}
 	app := NewApp()
 	app.Register(&trackingProvider{name: "svc", tracker: tracker})
 
-	app.Boot()
-	app.Boot() // 第二次应为 no-op
+	app.Boot(ctx)
+	app.Boot(ctx) // 第二次应为 no-op
 
 	if len(tracker.log) != 2 {
 		t.Fatalf("expected 2 events (idempotent), got %d: %v", len(tracker.log), tracker.log)
@@ -124,6 +126,7 @@ func TestApplicationBootIdempotent(t *testing.T) {
 }
 
 func TestApplicationDeferrableProvider(t *testing.T) {
+	ctx := context.Background()
 	tracker := &orderTracker{}
 	app := NewApp()
 	app.Register(
@@ -131,7 +134,7 @@ func TestApplicationDeferrableProvider(t *testing.T) {
 		&deferredProvider{name: "es", tracker: tracker},
 	)
 
-	if err := app.Boot(); err != nil {
+	if err := app.Boot(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -155,6 +158,7 @@ func TestApplicationDeferrableProvider(t *testing.T) {
 }
 
 func TestApplicationShutdownReverseOrder(t *testing.T) {
+	ctx := context.Background()
 	app := NewApp()
 	c := app.Container()
 
@@ -166,7 +170,7 @@ func TestApplicationShutdownReverseOrder(t *testing.T) {
 	c.Instance("second", svc2)
 	c.Instance("third", svc3)
 
-	err := app.Shutdown(context.Background())
+	err := app.Shutdown(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,13 +181,14 @@ func TestApplicationShutdownReverseOrder(t *testing.T) {
 }
 
 func TestApplicationShutdownAggregatesErrors(t *testing.T) {
+	ctx := context.Background()
 	app := NewApp()
 	c := app.Container()
 
 	c.Instance("svc1", &closeableErrorService{name: "svc1"})
 	c.Instance("svc2", &closeableErrorService{name: "svc2"})
 
-	err := app.Shutdown(context.Background())
+	err := app.Shutdown(ctx)
 	if err == nil {
 		t.Fatal("expected aggregated error")
 	}
@@ -195,6 +200,7 @@ func TestApplicationShutdownAggregatesErrors(t *testing.T) {
 }
 
 func TestApplicationHealthCheck(t *testing.T) {
+	ctx := context.Background()
 	app := NewApp()
 	c := app.Container()
 
@@ -202,7 +208,7 @@ func TestApplicationHealthCheck(t *testing.T) {
 	c.Instance("unhealthy", &unhealthyService{})
 	c.Instance("plain", "not-a-health-checker")
 
-	result := app.HealthCheck(context.Background())
+	result := app.HealthCheck(ctx)
 
 	// 只有实现 HealthChecker 的服务才会被检查
 	if len(result) != 2 {
@@ -217,6 +223,7 @@ func TestApplicationHealthCheck(t *testing.T) {
 }
 
 func TestApplicationWithContainer(t *testing.T) {
+	ctx := context.Background()
 	c := New()
 	c.Instance("existing", "value")
 
@@ -225,27 +232,29 @@ func TestApplicationWithContainer(t *testing.T) {
 		t.Fatal("should use provided container")
 	}
 
-	v, err := app.Container().Make("existing")
+	v, err := app.Container().Make(ctx, "existing")
 	if err != nil || v != "value" {
 		t.Fatal("should access existing bindings")
 	}
 }
 
 func TestApplicationRegisterError(t *testing.T) {
+	ctx := context.Background()
 	app := NewApp()
 	app.Register(&errorProvider{phase: "register"})
 
-	err := app.Boot()
+	err := app.Boot(ctx)
 	if err == nil {
 		t.Fatal("expected register error")
 	}
 }
 
 func TestApplicationBootError(t *testing.T) {
+	ctx := context.Background()
 	app := NewApp()
 	app.Register(&errorProvider{phase: "boot"})
 
-	err := app.Boot()
+	err := app.Boot(ctx)
 	if err == nil {
 		t.Fatal("expected boot error")
 	}
@@ -262,7 +271,7 @@ func (p *errorProvider) Register(c Container) error {
 	return nil
 }
 
-func (p *errorProvider) Boot(c Container) error {
+func (p *errorProvider) Boot(_ context.Context, c Container) error {
 	if p.phase == "boot" {
 		return errors.New("boot failed")
 	}

@@ -2,17 +2,9 @@ package ioc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 )
-
-// containerInternals 容器内部接口，用于 Application 访问单例信息。
-// 自定义 Container 实现可选择实现此接口以支持 Shutdown/HealthCheck。
-type containerInternals interface {
-	Order() []string
-	Singletons() map[string]any
-}
 
 // Application 编排 ServiceProvider 的生命周期。
 //
@@ -57,10 +49,11 @@ func (a *Application) Container() Container {
 
 // Boot 执行两阶段初始化：
 //  1. 依次调用所有 Provider 的 Register()
-//  2. 依次调用所有 Provider 的 Boot()
+//  2. 依次调用所有 Provider 的 Boot(ctx)
 //
 // Boot 是幂等的，重复调用不会产生副作用。
-func (a *Application) Boot() error {
+// ctx 用于控制 Boot 阶段的超时和取消。
+func (a *Application) Boot(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -81,7 +74,7 @@ func (a *Application) Boot() error {
 		if dp, ok := p.(DeferrableProvider); ok && dp.Deferred() {
 			continue
 		}
-		if err := p.Boot(a.container); err != nil {
+		if err := p.Boot(ctx, a.container); err != nil {
 			return fmt.Errorf("ioc: provider Boot: %w", err)
 		}
 	}
@@ -90,57 +83,14 @@ func (a *Application) Boot() error {
 	return nil
 }
 
-// Shutdown 优雅关闭所有实现了 Closeable 接口的单例。
-// 按创建的逆序执行 Close，确保依赖关系正确释放。
-// 所有错误通过 errors.Join 聚合返回。
-//
-// 若底层 Container 未实现 containerInternals 接口（自定义实现），
-// 则 Shutdown 为 no-op 并返回 nil。
+// Shutdown 优雅关闭：委托给 Container.Close。
+// 按创建的逆序关闭所有实现了 Closeable 接口的单例。
 func (a *Application) Shutdown(ctx context.Context) error {
-	ci, ok := a.container.(containerInternals)
-	if !ok {
-		return nil
-	}
-
-	order := ci.Order()
-	singletons := ci.Singletons()
-
-	var errs []error
-	// 反序遍历
-	for i := len(order) - 1; i >= 0; i-- {
-		name := order[i]
-		val, exists := singletons[name]
-		if !exists {
-			continue
-		}
-		if closeable, ok := val.(Closeable); ok {
-			if err := closeable.Close(ctx); err != nil {
-				errs = append(errs, fmt.Errorf("ioc: close %q: %w", name, err))
-			}
-		}
-	}
-
-	return errors.Join(errs...)
+	return a.container.Close(ctx)
 }
 
-// HealthCheck 对所有实现了 HealthChecker 接口的单例执行健康检查。
+// HealthCheck 健康检查：委托给 Container.HealthCheck。
 // 返回 name → error 映射，error 为 nil 表示健康。
-//
-// 若底层 Container 未实现 containerInternals 接口，返回 nil。
 func (a *Application) HealthCheck(ctx context.Context) map[string]error {
-	ci, ok := a.container.(containerInternals)
-	if !ok {
-		return nil
-	}
-
-	singletons := ci.Singletons()
-	result := make(map[string]error)
-
-	for name, val := range singletons {
-		if checker, ok := val.(HealthChecker); ok {
-			result[name] = checker.Health(ctx)
-		}
-	}
-
-	return result
+	return a.container.HealthCheck(ctx)
 }
