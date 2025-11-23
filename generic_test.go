@@ -29,6 +29,9 @@ func TestMakeTypedWrongType(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected type mismatch error")
 	}
+	if !errors.Is(err, ErrTypeMismatch) {
+		t.Fatalf("expected ErrTypeMismatch, got %v", err)
+	}
 }
 
 func TestMakeTypedNotBound(t *testing.T) {
@@ -91,5 +94,20 @@ func TestMakeTypedInterface(t *testing.T) {
 	}
 	if v.Name() != "test" {
 		t.Fatalf("expected 'test', got %q", v.Name())
+	}
+}
+
+func TestMakeTypedViaAlias(t *testing.T) {
+	c := New()
+	ctx := context.Background()
+	c.Instance("database", "mysql")
+	c.Alias("db", "database")
+
+	v, err := MakeTyped[string](ctx, c, "db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "mysql" {
+		t.Fatalf("expected 'mysql', got %q", v)
 	}
 }

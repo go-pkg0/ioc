@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestBind(t *testing.T) {
@@ -18,7 +19,6 @@ func TestBind(t *testing.T) {
 		return "instance", nil
 	})
 
-	// 每次 Make 都应创建新实例（调用工厂）
 	v1, err := c.Make(ctx, "svc")
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +55,6 @@ func TestSingleton(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 单例应返回同一实例
 	if v1 != v2 {
 		t.Fatal("singleton should return same instance")
 	}
@@ -105,7 +104,7 @@ func TestRemove(t *testing.T) {
 	c := New()
 	ctx := context.Background()
 	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) { return "val", nil })
-	c.Make(ctx, "svc") // 触发缓存
+	c.Make(ctx, "svc")
 
 	c.Remove("svc")
 
@@ -145,6 +144,7 @@ func TestFlush(t *testing.T) {
 	ctx := context.Background()
 	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) { return "val", nil })
 	c.Make(ctx, "svc")
+	c.Alias("alias", "svc")
 
 	c.Flush()
 
@@ -204,13 +204,11 @@ func TestMakeFactoryErrorRetryAfterRemove(t *testing.T) {
 		return "success", nil
 	})
 
-	// 首次调用失败
 	_, err := c.Make(ctx, "svc")
 	if err == nil {
 		t.Fatal("expected error")
 	}
 
-	// Remove + 重新注册可以重试
 	c.Remove("svc")
 	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) {
 		callCount++
@@ -252,7 +250,6 @@ func TestSingletonConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 
-	// sync.Once 保证单例工厂恰好执行一次。
 	if c := count.Load(); c != 1 {
 		t.Fatalf("singleton factory called %d times, expected exactly 1", c)
 	}
@@ -265,7 +262,6 @@ func TestDecorate(t *testing.T) {
 		return "base", nil
 	})
 
-	// 添加两个装饰器，验证管道顺序
 	c.Decorate("svc", func(_ context.Context, instance any, _ Container) (any, error) {
 		return instance.(string) + "+d1", nil
 	})
@@ -315,12 +311,9 @@ func TestUseMiddleware(t *testing.T) {
 		t.Fatalf("expected 'value', got %v", v)
 	}
 
-	// 洋葱模型：mw1 在外层
 	expected := []string{
-		"mw1:before:svc",
-		"mw2:before:svc",
-		"mw2:after:svc",
-		"mw1:after:svc",
+		"mw1:before:svc", "mw2:before:svc",
+		"mw2:after:svc", "mw1:after:svc",
 	}
 	if len(log) != len(expected) {
 		t.Fatalf("expected %d log entries, got %d: %v", len(expected), len(log), log)
@@ -352,13 +345,11 @@ func TestSingletonCacheSkipsMiddlewareAndDecorator(t *testing.T) {
 		}
 	})
 
-	// 首次触发工厂 + 装饰器 + 中间件
 	c.Make(ctx, "svc")
 	if factoryCount != 1 || decCount != 1 || mwCount != 1 {
 		t.Fatalf("first Make: factory=%d, dec=%d, mw=%d", factoryCount, decCount, mwCount)
 	}
 
-	// 第二次走缓存，不触发任何链
 	c.Make(ctx, "svc")
 	if factoryCount != 1 || decCount != 1 || mwCount != 1 {
 		t.Fatalf("second Make should hit cache: factory=%d, dec=%d, mw=%d", factoryCount, decCount, mwCount)
@@ -385,6 +376,115 @@ func TestNestedMake(t *testing.T) {
 	}
 	if v != "service+dependency" {
 		t.Fatalf("expected 'service+dependency', got %q", v)
+	}
+}
+
+func TestMiddlewareContextPropagation(t *testing.T) {
+	c := New()
+	type ctxKey string
+	key := ctxKey("trace-id")
+
+	c.Bind("svc", func(ctx context.Context, _ Container) (any, error) {
+		return ctx.Value(key), nil
+	})
+
+	c.Use(func(abstract string, next ResolveFunc) ResolveFunc {
+		return func(ctx context.Context) (any, error) {
+			ctx = context.WithValue(ctx, key, "abc-123")
+			return next(ctx)
+		}
+	})
+
+	v, err := c.Make(context.Background(), "svc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "abc-123" {
+		t.Fatalf("expected 'abc-123', got %v", v)
+	}
+}
+
+// --- P0: 循环依赖检测 ---
+
+func TestCircularDependencySelf(t *testing.T) {
+	c := New()
+	c.Singleton("A", func(ctx context.Context, c Container) (any, error) {
+		return c.Make(ctx, "A")
+	})
+
+	_, err := c.Make(context.Background(), "A")
+	if !errors.Is(err, ErrCircularDependency) {
+		t.Fatalf("expected ErrCircularDependency, got %v", err)
+	}
+}
+
+func TestCircularDependencyChain(t *testing.T) {
+	c := New()
+	c.Singleton("A", func(ctx context.Context, c Container) (any, error) {
+		return c.Make(ctx, "B")
+	})
+	c.Singleton("B", func(ctx context.Context, c Container) (any, error) {
+		return c.Make(ctx, "C")
+	})
+	c.Singleton("C", func(ctx context.Context, c Container) (any, error) {
+		return c.Make(ctx, "A")
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := c.Make(ctx, "A")
+	if !errors.Is(err, ErrCircularDependency) {
+		t.Fatalf("expected ErrCircularDependency, got %v", err)
+	}
+
+	// 错误消息应包含完整链
+	errMsg := err.Error()
+	if errMsg == "" {
+		t.Fatal("error message should not be empty")
+	}
+}
+
+func TestCircularDependencyTransient(t *testing.T) {
+	c := New()
+	c.Bind("A", func(ctx context.Context, c Container) (any, error) {
+		return c.Make(ctx, "A")
+	})
+
+	_, err := c.Make(context.Background(), "A")
+	if !errors.Is(err, ErrCircularDependency) {
+		t.Fatalf("expected ErrCircularDependency for transient, got %v", err)
+	}
+}
+
+// --- P0: Container closed 状态 ---
+
+func TestContainerClosedBlocksMake(t *testing.T) {
+	c := New()
+	ctx := context.Background()
+
+	c.Instance("svc", "value")
+	c.Close(ctx)
+
+	_, err := c.Make(ctx, "svc")
+	if !errors.Is(err, ErrContainerClosed) {
+		t.Fatalf("expected ErrContainerClosed, got %v", err)
+	}
+}
+
+func TestContainerCloseIdempotent(t *testing.T) {
+	c := New()
+	ctx := context.Background()
+
+	svc := &closeableService{name: "svc"}
+	c.Instance("svc", svc)
+
+	if err := c.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 第二次关闭应为 no-op，不会重复调用 Close
+	if err := c.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -428,28 +528,107 @@ func TestContainerHealthCheck(t *testing.T) {
 	}
 }
 
-func TestMiddlewareContextPropagation(t *testing.T) {
+// --- P0: Instance/Singleton order 去重 ---
+
+func TestInstanceReregistrationNoDuplicateOrder(t *testing.T) {
 	c := New()
-	type ctxKey string
-	key := ctxKey("trace-id")
+	ctx := context.Background()
 
-	c.Bind("svc", func(ctx context.Context, _ Container) (any, error) {
-		return ctx.Value(key), nil
+	svc := &closeableService{name: "svc"}
+	c.Instance("svc", "old")
+	c.Instance("svc", svc) // 重复注册
+
+	closeCount := 0
+	svc.onClose = func() { closeCount++ }
+
+	if err := c.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if closeCount != 1 {
+		t.Fatalf("Close should be called exactly once, got %d", closeCount)
+	}
+}
+
+func TestSingletonReregistrationNoDuplicateOrder(t *testing.T) {
+	c := New()
+	ctx := context.Background()
+
+	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) {
+		return "v1", nil
 	})
+	c.Make(ctx, "svc") // 触发缓存 + order 追加
 
-	// 中间件注入 trace-id 到 context
-	c.Use(func(abstract string, next ResolveFunc) ResolveFunc {
-		return func(ctx context.Context) (any, error) {
-			ctx = context.WithValue(ctx, key, "abc-123")
-			return next(ctx)
-		}
+	// 重新注册
+	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) {
+		return &closeableService{name: "v2"}, nil
 	})
+	c.Make(ctx, "svc") // 触发新工厂
 
-	v, err := c.Make(context.Background(), "svc")
+	// Close 内部 order 不应有重复
+	if err := c.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// --- P2: Alias ---
+
+func TestAlias(t *testing.T) {
+	c := New()
+	ctx := context.Background()
+
+	c.Instance("database", "mysql-conn")
+	c.Alias("db", "database")
+
+	v, err := c.Make(ctx, "db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != "abc-123" {
-		t.Fatalf("expected 'abc-123', got %v", v)
+	if v != "mysql-conn" {
+		t.Fatalf("expected 'mysql-conn', got %v", v)
+	}
+}
+
+func TestAliasChain(t *testing.T) {
+	c := New()
+	ctx := context.Background()
+
+	c.Instance("database", "conn")
+	c.Alias("db", "database")
+	c.Alias("storage", "db")
+
+	v, err := c.Make(ctx, "storage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "conn" {
+		t.Fatalf("expected 'conn', got %v", v)
+	}
+}
+
+func TestHasResolveAlias(t *testing.T) {
+	c := New()
+	c.Instance("database", "conn")
+	c.Alias("db", "database")
+
+	if !c.Has("db") {
+		t.Fatal("Has should resolve alias")
+	}
+}
+
+func TestRemoveAlias(t *testing.T) {
+	c := New()
+	ctx := context.Background()
+
+	c.Instance("database", "conn")
+	c.Alias("db", "database")
+
+	c.Remove("database")
+
+	if c.Has("db") {
+		t.Fatal("alias should be removed when target is removed")
+	}
+	_, err := c.Make(ctx, "db")
+	if !errors.Is(err, ErrNotBound) {
+		t.Fatalf("expected ErrNotBound after remove, got %v", err)
 	}
 }

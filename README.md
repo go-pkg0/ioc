@@ -7,12 +7,14 @@ go-pkg0 生态的基础依赖注入框架，灵感来自 Laravel Service Contain
 ## 特性
 
 - **Container** — 服务绑定与解析（Bind / Singleton / Instance / Make），全链路 context.Context 传递
+- **别名系统** — `Alias(alias, abstract)` 支持链式别名解析（最大深度 10），同一服务可多名访问
+- **循环依赖检测** — 基于 context 的 per-goroutine 解析栈，Make 时自动检测并报告完整循环路径
 - **AOP** — 全局中间件（Middleware）+ 服务装饰器（Decorator），洋葱模型，支持链路追踪注入
-- **ServiceProvider** — 两阶段生命周期（Register / Boot），支持延迟初始化
+- **ServiceProvider** — 两阶段生命周期（Register / Boot），支持延迟初始化 + `ProvidesAware` 内省
 - **DriverManager[T]** — 泛型多驱动管理器，延迟创建 + 缓存 + 优雅关闭，适配 db、cache、log 等多驱动场景
 - **服务契约** — Closeable / HealthChecker / Configurable / ServiceInfo
-- **Application** — 轻量编排器，自动 Boot / Shutdown / HealthCheck
-- **生命周期管理** — Container 内置 Close / HealthCheck，无需隐式接口
+- **Application** — 轻量编排器，完整状态机（created→booting→booted→shutdown/failed），自动 Boot / Shutdown / HealthCheck
+- **生命周期管理** — Container 内置 Close（幂等）/ HealthCheck（并行），关闭后 Make 返回 `ErrContainerClosed`
 - **并发安全** — per-key `sync.Once` 保证单例工厂恰好执行一次，永久缓存错误避免竞态
 - **零依赖** — 纯标准库，任何框架均可使用
 
@@ -152,13 +154,14 @@ defer mgr.Close(ctx)
 | `Bind(name, factory)` | 注册瞬时工厂，每次 Make 创建新实例 |
 | `Singleton(name, factory)` | 注册单例工厂，首次 Make 后缓存 |
 | `Instance(name, value)` | 注册已构建实例为单例 |
-| `Make(ctx, name)` | 按名称解析服务，ctx 传递给工厂和装饰器 |
+| `Alias(alias, abstract)` | 注册别名，支持链式解析（最大深度 10） |
+| `Make(ctx, name)` | 按名称解析服务，自动检测循环依赖，ctx 传递给工厂和装饰器 |
 | `MustMake(ctx, name)` | 解析服务，失败 panic |
-| `Has(name)` | 判断是否已注册 |
+| `Has(name)` | 判断是否已注册（自动解析别名） |
 | `Decorate(name, decorator)` | 添加服务装饰器 |
 | `Use(middleware...)` | 注册全局中间件 |
-| `Close(ctx)` | 反序优雅关闭所有 Closeable 单例 |
-| `HealthCheck(ctx)` | 对所有 HealthChecker 单例执行健康检查 |
+| `Close(ctx)` | 反序优雅关闭所有 Closeable 单例（幂等） |
+| `HealthCheck(ctx)` | 并行对所有 HealthChecker 单例执行健康检查 |
 | `Remove(name)` | 删除绑定及缓存 |
 | `Bindings()` | 返回所有已注册名称 |
 | `Flush()` | 清空所有绑定和缓存 |
@@ -182,7 +185,31 @@ val, err := ioc.MakeTyped[*MyService](ctx, container, "my-service")
 val := ioc.MustMakeTyped[*MyService](ctx, container, "my-service")
 ```
 
+## 别名
+
+```go
+c := ioc.New()
+c.Instance("database.mysql", mysqlConn)
+c.Alias("db", "database.mysql")      // db → database.mysql
+c.Alias("default-db", "db")          // default-db → db → database.mysql
+
+conn, err := c.Make(ctx, "default-db") // 自动链式解析
+```
+
 ## 错误处理
+
+### 哨兵错误
+
+| 错误 | 说明 |
+|------|------|
+| `ErrNotBound` | 服务未注册 |
+| `ErrNoFactory` | 绑定无工厂函数 |
+| `ErrDriverNotFound` | DriverManager 中驱动未注册 |
+| `ErrCircularDependency` | 检测到循环依赖（包含完整路径） |
+| `ErrContainerClosed` | 容器已关闭，拒绝新的 Make |
+| `ErrTypeMismatch` | `MakeTyped` 类型断言失败 |
+
+### 单例错误缓存
 
 单例工厂返回的错误会被**永久缓存**，后续调用返回相同错误，避免并发竞态。如需重试：
 

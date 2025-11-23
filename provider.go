@@ -45,3 +45,17 @@ type DeferrableProvider interface {
 	ServiceProvider
 	Deferred() bool
 }
+
+// ProvidesAware 是可选接口，声明 Provider 提供的服务名称。
+//
+// 当 DeferrableProvider 同时实现此接口时，Application 可据此
+// 了解哪些服务由该 Provider 提供，支持内省和依赖分析。
+//
+// 示例:
+//
+//	func (p *ESServiceProvider) Provides() []string {
+//	    return []string{"es", "es.client"}
+//	}
+type ProvidesAware interface {
+	Provides() []string
+}

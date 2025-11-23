@@ -6,7 +6,7 @@ import (
 )
 
 // MakeTyped 解析服务实例并断言为目标类型 T。
-// 解析失败或类型不匹配时返回 T 的零值和错误。
+// 解析失败返回底层错误，类型不匹配返回 ErrTypeMismatch。
 //
 // 示例:
 //
@@ -20,7 +20,7 @@ func MakeTyped[T any](ctx context.Context, c Container, abstract string) (T, err
 	typed, ok := val.(T)
 	if !ok {
 		var zero T
-		return zero, fmt.Errorf("ioc: %q resolved to %T, want %T", abstract, val, zero)
+		return zero, fmt.Errorf("%w: %q resolved to %T, want %T", ErrTypeMismatch, abstract, val, zero)
 	}
 	return typed, nil
 }

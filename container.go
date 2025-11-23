@@ -11,12 +11,13 @@ type Factory func(ctx context.Context, c Container) (any, error)
 //
 // 实现必须是并发安全的。
 //
-// Container 提供五类能力：
-//   - 绑定：注册服务工厂（瞬时、单例、实例）
-//   - 解析：按名称获取服务实例
+// Container 提供六类能力：
+//   - 绑定：注册服务工厂（瞬时、单例、实例、别名）
+//   - 解析：按名称获取服务实例（自动解析别名、检测循环依赖）
 //   - AOP：装饰器和全局中间件，支持横切关注点无侵入注入
 //   - 生命周期：优雅关闭和健康检查
 //   - 管理：删除、内省、清空
+//   - 安全：循环依赖检测、关闭状态保护
 type Container interface {
 	// ---- 绑定 ----
 
@@ -32,18 +33,24 @@ type Container interface {
 	// 注意：Instance 注册的服务不经过装饰器和中间件链。
 	Instance(abstract string, value any)
 
+	// Alias 为已注册的服务创建别名。
+	// Make("alias") 等价于 Make("abstract")。
+	// 支持链式别名（最大深度 10 层）。
+	Alias(alias, abstract string)
+
 	// ---- 解析 ----
 
 	// Make 按名称解析服务实例。
+	// 自动解析别名，检测循环依赖（同 goroutine 内）。
+	// 容器关闭后返回 ErrContainerClosed。
 	// ctx 会传递给工厂函数和装饰器，用于超时控制和链路追踪。
-	// 未找到绑定时返回包装了 ErrNotBound 的错误。
 	Make(ctx context.Context, abstract string) (any, error)
 
 	// MustMake 解析服务实例，失败时 panic。
 	// 适用于启动期和测试场景。
 	MustMake(ctx context.Context, abstract string) any
 
-	// Has 判断指定名称是否已注册绑定。
+	// Has 判断指定名称是否已注册绑定（自动解析别名）。
 	Has(abstract string) bool
 
 	// ---- AOP ----
@@ -63,15 +70,17 @@ type Container interface {
 	// Close 优雅关闭所有实现了 Closeable 接口的单例。
 	// 按创建的逆序执行 Close，确保依赖关系正确释放。
 	// 所有错误通过 errors.Join 聚合返回。
+	// Close 是幂等的，重复调用返回 nil。
+	// Close 后 Make 调用将返回 ErrContainerClosed。
 	Close(ctx context.Context) error
 
-	// HealthCheck 对所有实现了 HealthChecker 接口的单例执行健康检查。
+	// HealthCheck 对所有实现了 HealthChecker 接口的单例并行执行健康检查。
 	// 返回 name → error 映射，error 为 nil 表示健康。
 	HealthCheck(ctx context.Context) map[string]error
 
 	// ---- 管理 ----
 
-	// Remove 删除指定名称的绑定及其缓存的单例。
+	// Remove 删除指定名称的绑定、别名及其缓存的单例。
 	// 适用于测试和热重载场景。
 	Remove(abstract string)
 
@@ -79,7 +88,7 @@ type Container interface {
 	// 适用于内省和调试。
 	Bindings() []string
 
-	// Flush 清空所有绑定、单例缓存和装饰器。
+	// Flush 清空所有绑定、单例缓存、别名和装饰器。
 	// 适用于测试场景。
 	Flush()
 }
