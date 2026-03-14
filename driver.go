@@ -61,11 +61,21 @@ type DriverManager[T Driver] interface {
 }
 
 // driverEntry 使用 sync.Once 保证驱动工厂仅执行一次。
+// factory 必须在创建 entry 时赋值，确保任何 goroutine 赢得 Once 竞争都能执行真实工厂。
 // 工厂错误会被永久缓存，避免并发竞态。
 type driverEntry[T any] struct {
-	once sync.Once
-	val  T
-	err  error
+	once    sync.Once
+	factory func(ctx context.Context) (T, error) // 创建时赋值，不可变
+	val     T
+	err     error
+}
+
+// resolve 通过 sync.Once 保证工厂仅执行一次。
+// 任何 goroutine 调用 resolve 都安全：仅第一个执行工厂，其余等待。
+func (e *driverEntry[T]) resolve(ctx context.Context) {
+	e.once.Do(func() {
+		e.val, e.err = e.factory(ctx)
+	})
 }
 
 // driverManager 是 DriverManager 的默认实现。
@@ -108,7 +118,8 @@ func (m *driverManager[T]) Driver(ctx context.Context, name string) (T, error) {
 
 	if cached {
 		// entry 存在 — 等待创建完成（已完成时为无开销的原子检查）。
-		entry.once.Do(func() {})
+		// entry.factory 在创建时已赋值，任何 goroutine 赢得 Once 竞争都安全。
+		entry.resolve(ctx)
 		if entry.err != nil {
 			var zero T
 			return zero, entry.err
@@ -122,22 +133,20 @@ func (m *driverManager[T]) Driver(ctx context.Context, name string) (T, error) {
 	entry, cached = m.entries[name]
 	if cached {
 		m.mu.Unlock()
-		entry.once.Do(func() {})
+		entry.resolve(ctx)
 		if entry.err != nil {
 			var zero T
 			return zero, entry.err
 		}
 		return entry.val, nil
 	}
-	entry = &driverEntry[T]{}
-	m.entries[name] = entry
 	factory := m.factories[name]
+	entry = &driverEntry[T]{factory: factory}
+	m.entries[name] = entry
 	m.mu.Unlock()
 
-	// sync.Once 保证工厂仅执行一次，且在锁外执行（避免死锁）。
-	entry.once.Do(func() {
-		entry.val, entry.err = factory(ctx)
-	})
+	// resolve 通过 sync.Once 保证工厂仅执行一次，且在锁外执行（避免死锁）。
+	entry.resolve(ctx)
 
 	// 工厂错误被永久缓存，不清除 entry，避免并发竞态。
 	if entry.err != nil {
@@ -203,8 +212,8 @@ func (m *driverManager[T]) Close(ctx context.Context) error {
 
 	var errs []error
 	for name, entry := range entries {
-		// 等待任何进行中的创建完成。
-		entry.once.Do(func() {})
+		// 等待任何进行中的创建完成（entry.factory 已赋值，安全）。
+		entry.resolve(ctx)
 		if entry.err != nil {
 			continue
 		}

@@ -2,14 +2,22 @@ package ioc
 
 import "context"
 
-// Factory 服务工厂函数。
-// 接收 context 和容器引用，返回服务实例或错误。
-// context 由 Make 调用方传入，用于控制超时、取消和链路追踪。
+// Factory 服务工厂函数（容器内部使用 any 存储异构类型）。
+// 推荐使用泛型函数 Singleton[T] / Bind[T] 注册，编译期约束返回类型。
+// ctx 由 Make 调用方传入，用于控制超时、取消和链路追踪。
 type Factory func(ctx context.Context, c Container) (any, error)
 
 // Container 是核心依赖注入容器接口。
 //
 // 实现必须是并发安全的。
+//
+// 推荐通过泛型函数操作容器，获得编译期类型安全：
+//
+//	ioc.Singleton(c, "db", func(ctx context.Context, c ioc.Container) (*sql.DB, error) { ... })
+//	ioc.Decorate(c, "db", func(ctx context.Context, db *sql.DB, c ioc.Container) (*sql.DB, error) { ... })
+//	db, err := ioc.Make[*sql.DB](ctx, c, "db")
+//
+// Container 接口方法为底层 API，仅在框架扩展或中间件场景中直接使用。
 //
 // Container 提供六类能力：
 //   - 绑定：注册服务工厂（瞬时、单例、实例、别名）

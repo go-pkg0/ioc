@@ -161,8 +161,9 @@ func (c *container) Make(ctx context.Context, abstract string) (any, error) {
 		entry.val, entry.err = resolve(ctx)
 	})
 
-	// 工厂错误被永久缓存，不清除 entry，避免并发竞态。
-	// 如需重试，调用 Remove 后重新 Singleton 注册。
+	// 工厂错误被永久缓存在 pending 中，后续调用返回相同错误。
+	// 成功的结果会提升到 singletons 缓存并从 pending 中移除。
+	// 如需重试错误，调用 Remove 后重新 Singleton 注册。
 	if entry.err != nil {
 		return nil, entry.err
 	}
@@ -276,10 +277,16 @@ func (c *container) HealthCheck(ctx context.Context) map[string]error {
 		wg.Add(1)
 		go func(name string, checker HealthChecker) {
 			defer wg.Done()
-			err := checker.Health(ctx)
-			mu.Lock()
-			result[name] = err
-			mu.Unlock()
+			var err error
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("ioc: health check %q panicked: %v", name, r)
+				}
+				mu.Lock()
+				result[name] = err
+				mu.Unlock()
+			}()
+			err = checker.Health(ctx)
 		}(e.name, e.checker)
 	}
 
@@ -327,10 +334,12 @@ func (c *container) Bindings() []string {
 	return names
 }
 
-// Flush 清空所有绑定、单例缓存、别名和装饰器。
+// Flush 清空所有绑定、单例缓存、别名和装饰器，并重置关闭状态。
+// 适用于测试场景，允许容器在 Close 后通过 Flush 恢复可用。
 func (c *container) Flush() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.closed.Store(false) // 重置关闭状态，允许 Flush 后继续使用
 	c.bindings = make(map[string]binding)
 	c.singletons = make(map[string]any)
 	c.pending = make(map[string]*singletonEntry)
@@ -341,16 +350,21 @@ func (c *container) Flush() {
 }
 
 // resolveAliasLocked 解析别名链（必须持有读锁）。
-// 最大深度 10 层，防止循环别名。
+// 最大深度 10 层，检测循环别名并 panic（编程错误）。
 func (c *container) resolveAliasLocked(abstract string) string {
+	origin := abstract
 	for i := 0; i < 10; i++ {
 		target, ok := c.aliases[abstract]
 		if !ok {
 			return abstract
 		}
 		abstract = target
+		// 检测循环别名（回到起点）。
+		if abstract == origin {
+			panic(fmt.Sprintf("ioc: circular alias detected: %q", origin))
+		}
 	}
-	return abstract
+	panic(fmt.Sprintf("ioc: alias chain too deep (>10) starting from %q", origin))
 }
 
 // checkCircular 检测循环依赖。

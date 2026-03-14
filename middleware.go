@@ -26,16 +26,17 @@ type ResolveFunc func(ctx context.Context) (any, error)
 //	})
 type Middleware func(abstract string, next ResolveFunc) ResolveFunc
 
-// Decorator 服务装饰器 — 针对特定服务的后处理。
+// Decorator 服务装饰器 — 针对特定服务的后处理（底层非泛型签名）。
+//
+// 推荐使用泛型函数 Decorate[T] 获得类型安全：
+//
+//	ioc.Decorate(c, "db", func(ctx context.Context, pool *ConnectionPool, c ioc.Container) (*ConnectionPool, error) {
+//	    return NewReadWriteProxy(pool), nil
+//	})
 //
 // 在工厂函数返回后、缓存前执行，可包装/替换/增强实例。
 // 多个装饰器按注册顺序依次执行（管道模型）。
 // ctx 由 Make 传入，用于装饰器中的初始化操作。
 //
 // 适用于：连接池代理、读写分离包装、监控埋点、熔断器。
-//
-//	c.Decorate("db", func(ctx context.Context, instance any, c ioc.Container) (any, error) {
-//	    pool := instance.(*ConnectionPool)
-//	    return NewReadWriteProxy(pool), nil
-//	})
 type Decorator func(ctx context.Context, instance any, c Container) (any, error)
