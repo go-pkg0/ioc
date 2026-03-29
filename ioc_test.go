@@ -3,27 +3,35 @@ package ioc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
+// panicHealthService 测试 HealthCheck 的 panic 恢复。
+type panicHealthService struct{}
+
+func (s *panicHealthService) Health(_ context.Context) error {
+	panic("health check exploded")
+}
+
 func TestBind(t *testing.T) {
 	c := New()
 	ctx := context.Background()
 
 	callCount := 0
-	c.Bind("svc", func(_ context.Context, _ Container) (any, error) {
+	Bind(c, "svc", func(_ context.Context, _ Container) (string, error) {
 		callCount++
 		return "instance", nil
 	})
 
-	v1, err := c.Make(ctx, "svc")
+	v1, err := Make[string](ctx, c, "svc")
 	if err != nil {
 		t.Fatal(err)
 	}
-	v2, err := c.Make(ctx, "svc")
+	v2, err := Make[string](ctx, c, "svc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,17 +48,18 @@ func TestSingleton(t *testing.T) {
 	c := New()
 	ctx := context.Background()
 
+	type svc struct{ Name string }
 	callCount := 0
-	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) {
+	Singleton(c, "svc", func(_ context.Context, _ Container) (*svc, error) {
 		callCount++
-		return &struct{ Name string }{"singleton"}, nil
+		return &svc{Name: "singleton"}, nil
 	})
 
-	v1, err := c.Make(ctx, "svc")
+	v1, err := Make[*svc](ctx, c, "svc")
 	if err != nil {
 		t.Fatal(err)
 	}
-	v2, err := c.Make(ctx, "svc")
+	v2, err := Make[*svc](ctx, c, "svc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,14 +75,15 @@ func TestSingleton(t *testing.T) {
 func TestInstance(t *testing.T) {
 	c := New()
 	ctx := context.Background()
-	obj := &struct{ ID int }{42}
-	c.Instance("svc", obj)
+	type obj struct{ ID int }
+	o := &obj{42}
+	Instance(c, "svc", o)
 
-	v, err := c.Make(ctx, "svc")
+	v, err := Make[*obj](ctx, c, "svc")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != obj {
+	if v != o {
 		t.Fatal("Instance should return exact same pointer")
 	}
 }
@@ -94,7 +104,7 @@ func TestHas(t *testing.T) {
 	if c.Has("svc") {
 		t.Fatal("should not have unregistered binding")
 	}
-	c.Bind("svc", func(_ context.Context, _ Container) (any, error) { return nil, nil })
+	Bind(c, "svc", func(_ context.Context, _ Container) (string, error) { return "", nil })
 	if !c.Has("svc") {
 		t.Fatal("should have registered binding")
 	}
@@ -103,8 +113,8 @@ func TestHas(t *testing.T) {
 func TestRemove(t *testing.T) {
 	c := New()
 	ctx := context.Background()
-	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) { return "val", nil })
-	c.Make(ctx, "svc")
+	Singleton(c, "svc", func(_ context.Context, _ Container) (string, error) { return "val", nil })
+	Make[string](ctx, c, "svc")
 
 	c.Remove("svc")
 
@@ -119,9 +129,9 @@ func TestRemove(t *testing.T) {
 
 func TestBindings(t *testing.T) {
 	c := New()
-	c.Bind("a", func(_ context.Context, _ Container) (any, error) { return nil, nil })
-	c.Singleton("b", func(_ context.Context, _ Container) (any, error) { return nil, nil })
-	c.Instance("c", "val")
+	Bind(c, "a", func(_ context.Context, _ Container) (string, error) { return "", nil })
+	Singleton(c, "b", func(_ context.Context, _ Container) (string, error) { return "", nil })
+	Instance(c, "c", "val")
 
 	names := c.Bindings()
 	if len(names) != 3 {
@@ -142,8 +152,8 @@ func TestBindings(t *testing.T) {
 func TestFlush(t *testing.T) {
 	c := New()
 	ctx := context.Background()
-	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) { return "val", nil })
-	c.Make(ctx, "svc")
+	Singleton(c, "svc", func(_ context.Context, _ Container) (string, error) { return "val", nil })
+	Make[string](ctx, c, "svc")
 	c.Alias("alias", "svc")
 
 	c.Flush()
@@ -171,18 +181,18 @@ func TestMakeFactoryError(t *testing.T) {
 
 	callCount := 0
 	expectedErr := errors.New("factory error")
-	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) {
+	Singleton(c, "svc", func(_ context.Context, _ Container) (string, error) {
 		callCount++
-		return nil, expectedErr
+		return "", expectedErr
 	})
 
-	_, err := c.Make(ctx, "svc")
+	_, err := Make[string](ctx, c, "svc")
 	if !errors.Is(err, expectedErr) {
 		t.Fatalf("expected factory error, got %v", err)
 	}
 
 	// 工厂错误被永久缓存，不会重新执行工厂
-	_, err = c.Make(ctx, "svc")
+	_, err = Make[string](ctx, c, "svc")
 	if !errors.Is(err, expectedErr) {
 		t.Fatalf("expected cached factory error, got %v", err)
 	}
@@ -196,26 +206,23 @@ func TestMakeFactoryErrorRetryAfterRemove(t *testing.T) {
 	ctx := context.Background()
 
 	callCount := 0
-	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) {
+	Singleton(c, "svc", func(_ context.Context, _ Container) (string, error) {
 		callCount++
-		if callCount == 1 {
-			return nil, errors.New("transient error")
-		}
-		return "success", nil
+		return "", errors.New("transient error")
 	})
 
-	_, err := c.Make(ctx, "svc")
+	_, err := Make[string](ctx, c, "svc")
 	if err == nil {
 		t.Fatal("expected error")
 	}
 
 	c.Remove("svc")
-	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) {
+	Singleton(c, "svc", func(_ context.Context, _ Container) (string, error) {
 		callCount++
 		return "success", nil
 	})
 
-	v, err := c.Make(ctx, "svc")
+	v, err := Make[string](ctx, c, "svc")
 	if err != nil {
 		t.Fatalf("expected success after re-register, got %v", err)
 	}
@@ -229,7 +236,7 @@ func TestSingletonConcurrency(t *testing.T) {
 	ctx := context.Background()
 
 	var count atomic.Int32
-	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) {
+	Singleton(c, "svc", func(_ context.Context, _ Container) (string, error) {
 		count.Add(1)
 		return "value", nil
 	})
@@ -239,7 +246,7 @@ func TestSingletonConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			v, err := c.Make(ctx, "svc")
+			v, err := Make[string](ctx, c, "svc")
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
@@ -258,18 +265,18 @@ func TestSingletonConcurrency(t *testing.T) {
 func TestDecorate(t *testing.T) {
 	c := New()
 	ctx := context.Background()
-	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) {
+	Singleton(c, "svc", func(_ context.Context, _ Container) (string, error) {
 		return "base", nil
 	})
 
-	c.Decorate("svc", func(_ context.Context, instance any, _ Container) (any, error) {
-		return instance.(string) + "+d1", nil
+	Decorate(c, "svc", func(_ context.Context, val string, _ Container) (string, error) {
+		return val + "+d1", nil
 	})
-	c.Decorate("svc", func(_ context.Context, instance any, _ Container) (any, error) {
-		return instance.(string) + "+d2", nil
+	Decorate(c, "svc", func(_ context.Context, val string, _ Container) (string, error) {
+		return val + "+d2", nil
 	})
 
-	v, err := c.Make(ctx, "svc")
+	v, err := Make[string](ctx, c, "svc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +288,7 @@ func TestDecorate(t *testing.T) {
 func TestUseMiddleware(t *testing.T) {
 	c := New()
 	ctx := context.Background()
-	c.Bind("svc", func(_ context.Context, _ Container) (any, error) {
+	Bind(c, "svc", func(_ context.Context, _ Container) (string, error) {
 		return "value", nil
 	})
 
@@ -303,7 +310,7 @@ func TestUseMiddleware(t *testing.T) {
 		}
 	})
 
-	v, err := c.Make(ctx, "svc")
+	v, err := Make[string](ctx, c, "svc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,13 +337,13 @@ func TestSingletonCacheSkipsMiddlewareAndDecorator(t *testing.T) {
 	ctx := context.Background()
 
 	var factoryCount, mwCount, decCount int
-	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) {
+	Singleton(c, "svc", func(_ context.Context, _ Container) (string, error) {
 		factoryCount++
 		return "value", nil
 	})
-	c.Decorate("svc", func(_ context.Context, instance any, _ Container) (any, error) {
+	Decorate(c, "svc", func(_ context.Context, val string, _ Container) (string, error) {
 		decCount++
-		return instance, nil
+		return val, nil
 	})
 	c.Use(func(abstract string, next ResolveFunc) ResolveFunc {
 		return func(ctx context.Context) (any, error) {
@@ -345,12 +352,12 @@ func TestSingletonCacheSkipsMiddlewareAndDecorator(t *testing.T) {
 		}
 	})
 
-	c.Make(ctx, "svc")
+	Make[string](ctx, c, "svc")
 	if factoryCount != 1 || decCount != 1 || mwCount != 1 {
 		t.Fatalf("first Make: factory=%d, dec=%d, mw=%d", factoryCount, decCount, mwCount)
 	}
 
-	c.Make(ctx, "svc")
+	Make[string](ctx, c, "svc")
 	if factoryCount != 1 || decCount != 1 || mwCount != 1 {
 		t.Fatalf("second Make should hit cache: factory=%d, dec=%d, mw=%d", factoryCount, decCount, mwCount)
 	}
@@ -359,18 +366,18 @@ func TestSingletonCacheSkipsMiddlewareAndDecorator(t *testing.T) {
 func TestNestedMake(t *testing.T) {
 	c := New()
 	ctx := context.Background()
-	c.Singleton("dep", func(_ context.Context, _ Container) (any, error) {
+	Singleton(c, "dep", func(_ context.Context, _ Container) (string, error) {
 		return "dependency", nil
 	})
-	c.Singleton("svc", func(ctx context.Context, c Container) (any, error) {
-		dep, err := c.Make(ctx, "dep")
+	Singleton(c, "svc", func(ctx context.Context, c Container) (string, error) {
+		dep, err := Make[string](ctx, c, "dep")
 		if err != nil {
-			return nil, err
+			return "", err
 		}
-		return "service+" + dep.(string), nil
+		return "service+" + dep, nil
 	})
 
-	v, err := c.Make(ctx, "svc")
+	v, err := Make[string](ctx, c, "svc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,8 +391,9 @@ func TestMiddlewareContextPropagation(t *testing.T) {
 	type ctxKey string
 	key := ctxKey("trace-id")
 
-	c.Bind("svc", func(ctx context.Context, _ Container) (any, error) {
-		return ctx.Value(key), nil
+	Bind(c, "svc", func(ctx context.Context, _ Container) (string, error) {
+		v, _ := ctx.Value(key).(string)
+		return v, nil
 	})
 
 	c.Use(func(abstract string, next ResolveFunc) ResolveFunc {
@@ -395,7 +403,7 @@ func TestMiddlewareContextPropagation(t *testing.T) {
 		}
 	})
 
-	v, err := c.Make(context.Background(), "svc")
+	v, err := Make[string](context.Background(), c, "svc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,8 +416,8 @@ func TestMiddlewareContextPropagation(t *testing.T) {
 
 func TestCircularDependencySelf(t *testing.T) {
 	c := New()
-	c.Singleton("A", func(ctx context.Context, c Container) (any, error) {
-		return c.Make(ctx, "A")
+	Singleton(c, "A", func(ctx context.Context, c Container) (string, error) {
+		return Make[string](ctx, c, "A")
 	})
 
 	_, err := c.Make(context.Background(), "A")
@@ -420,14 +428,14 @@ func TestCircularDependencySelf(t *testing.T) {
 
 func TestCircularDependencyChain(t *testing.T) {
 	c := New()
-	c.Singleton("A", func(ctx context.Context, c Container) (any, error) {
-		return c.Make(ctx, "B")
+	Singleton(c, "A", func(ctx context.Context, c Container) (string, error) {
+		return Make[string](ctx, c, "B")
 	})
-	c.Singleton("B", func(ctx context.Context, c Container) (any, error) {
-		return c.Make(ctx, "C")
+	Singleton(c, "B", func(ctx context.Context, c Container) (string, error) {
+		return Make[string](ctx, c, "C")
 	})
-	c.Singleton("C", func(ctx context.Context, c Container) (any, error) {
-		return c.Make(ctx, "A")
+	Singleton(c, "C", func(ctx context.Context, c Container) (string, error) {
+		return Make[string](ctx, c, "A")
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -447,8 +455,8 @@ func TestCircularDependencyChain(t *testing.T) {
 
 func TestCircularDependencyTransient(t *testing.T) {
 	c := New()
-	c.Bind("A", func(ctx context.Context, c Container) (any, error) {
-		return c.Make(ctx, "A")
+	Bind(c, "A", func(ctx context.Context, c Container) (string, error) {
+		return Make[string](ctx, c, "A")
 	})
 
 	_, err := c.Make(context.Background(), "A")
@@ -463,7 +471,7 @@ func TestContainerClosedBlocksMake(t *testing.T) {
 	c := New()
 	ctx := context.Background()
 
-	c.Instance("svc", "value")
+	Instance(c, "svc", "value")
 	c.Close(ctx)
 
 	_, err := c.Make(ctx, "svc")
@@ -477,7 +485,7 @@ func TestContainerCloseIdempotent(t *testing.T) {
 	ctx := context.Background()
 
 	svc := &closeableService{name: "svc"}
-	c.Instance("svc", svc)
+	Instance(c, "svc", svc)
 
 	if err := c.Close(ctx); err != nil {
 		t.Fatal(err)
@@ -494,8 +502,8 @@ func TestContainerClose(t *testing.T) {
 
 	svc1 := &closeableService{name: "first"}
 	svc2 := &closeableService{name: "second"}
-	c.Instance("first", svc1)
-	c.Instance("second", svc2)
+	Instance(c, "first", svc1)
+	Instance(c, "second", svc2)
 
 	err := c.Close(ctx)
 	if err != nil {
@@ -511,9 +519,9 @@ func TestContainerHealthCheck(t *testing.T) {
 	c := New()
 	ctx := context.Background()
 
-	c.Instance("healthy", &healthyService{})
-	c.Instance("unhealthy", &unhealthyService{})
-	c.Instance("plain", "not-a-health-checker")
+	Instance(c, "healthy", &healthyService{})
+	Instance(c, "unhealthy", &unhealthyService{})
+	Instance(c, "plain", "not-a-health-checker")
 
 	result := c.HealthCheck(ctx)
 
@@ -535,8 +543,8 @@ func TestInstanceReregistrationNoDuplicateOrder(t *testing.T) {
 	ctx := context.Background()
 
 	svc := &closeableService{name: "svc"}
-	c.Instance("svc", "old")
-	c.Instance("svc", svc) // 重复注册
+	Instance(c, "svc", "old")
+	Instance(c, "svc", svc) // 重复注册
 
 	closeCount := 0
 	svc.onClose = func() { closeCount++ }
@@ -553,16 +561,16 @@ func TestSingletonReregistrationNoDuplicateOrder(t *testing.T) {
 	c := New()
 	ctx := context.Background()
 
-	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) {
+	Singleton(c, "svc", func(_ context.Context, _ Container) (string, error) {
 		return "v1", nil
 	})
-	c.Make(ctx, "svc") // 触发缓存 + order 追加
+	Make[string](ctx, c, "svc") // 触发缓存 + order 追加
 
 	// 重新注册
-	c.Singleton("svc", func(_ context.Context, _ Container) (any, error) {
+	Singleton(c, "svc", func(_ context.Context, _ Container) (*closeableService, error) {
 		return &closeableService{name: "v2"}, nil
 	})
-	c.Make(ctx, "svc") // 触发新工厂
+	Make[*closeableService](ctx, c, "svc") // 触发新工厂
 
 	// Close 内部 order 不应有重复
 	if err := c.Close(ctx); err != nil {
@@ -576,10 +584,10 @@ func TestAlias(t *testing.T) {
 	c := New()
 	ctx := context.Background()
 
-	c.Instance("database", "mysql-conn")
+	Instance(c, "database", "mysql-conn")
 	c.Alias("db", "database")
 
-	v, err := c.Make(ctx, "db")
+	v, err := Make[string](ctx, c, "db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,11 +600,11 @@ func TestAliasChain(t *testing.T) {
 	c := New()
 	ctx := context.Background()
 
-	c.Instance("database", "conn")
+	Instance(c, "database", "conn")
 	c.Alias("db", "database")
 	c.Alias("storage", "db")
 
-	v, err := c.Make(ctx, "storage")
+	v, err := Make[string](ctx, c, "storage")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -607,7 +615,7 @@ func TestAliasChain(t *testing.T) {
 
 func TestHasResolveAlias(t *testing.T) {
 	c := New()
-	c.Instance("database", "conn")
+	Instance(c, "database", "conn")
 	c.Alias("db", "database")
 
 	if !c.Has("db") {
@@ -615,11 +623,89 @@ func TestHasResolveAlias(t *testing.T) {
 	}
 }
 
+func TestFlushResetsClosedState(t *testing.T) {
+	c := New()
+	ctx := context.Background()
+
+	Instance(c, "svc", "value")
+	c.Close(ctx)
+
+	// Close 后 Make 应返回 ErrContainerClosed
+	_, err := c.Make(ctx, "svc")
+	if !errors.Is(err, ErrContainerClosed) {
+		t.Fatalf("expected ErrContainerClosed, got %v", err)
+	}
+
+	// Flush 重置关闭状态
+	c.Flush()
+	Instance(c, "svc", "new-value")
+
+	v, err := Make[string](ctx, c, "svc")
+	if err != nil {
+		t.Fatalf("Flush should reset closed state, got %v", err)
+	}
+	if v != "new-value" {
+		t.Fatalf("expected 'new-value', got %q", v)
+	}
+}
+
+func TestCircularAliasPanics(t *testing.T) {
+	c := New()
+
+	c.Alias("a", "b")
+	c.Alias("b", "a")
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("circular alias should panic")
+		}
+	}()
+
+	c.Has("a") // triggers resolveAliasLocked
+}
+
+func TestAliasChainTooDeepPanics(t *testing.T) {
+	c := New()
+
+	// 创建超过 10 层的别名链
+	for i := 0; i < 12; i++ {
+		c.Alias(fmt.Sprintf("a%d", i), fmt.Sprintf("a%d", i+1))
+	}
+	Instance(c, "a12", "value")
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("alias chain too deep should panic")
+		}
+	}()
+
+	c.Has("a0") // triggers resolveAliasLocked
+}
+
+func TestHealthCheckPanicRecovery(t *testing.T) {
+	c := New()
+	ctx := context.Background()
+
+	Instance(c, "panicker", &panicHealthService{})
+	Instance(c, "healthy", &healthyService{})
+
+	result := c.HealthCheck(ctx)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 health checks, got %d", len(result))
+	}
+	if result["healthy"] != nil {
+		t.Fatal("healthy service should return nil error")
+	}
+	if result["panicker"] == nil {
+		t.Fatal("panicking service should return error")
+	}
+}
+
 func TestRemoveAlias(t *testing.T) {
 	c := New()
 	ctx := context.Background()
 
-	c.Instance("database", "conn")
+	Instance(c, "database", "conn")
 	c.Alias("db", "database")
 
 	c.Remove("database")

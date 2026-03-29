@@ -24,23 +24,24 @@ type HealthChecker interface {
 
 // Configurable 动态配置契约。
 //
+// 类型参数 T 为具体配置结构体类型，编译期约束配置类型，避免运行时断言。
 // 实现此接口的服务支持运行时配置热更新，无需重启。
-// cfg 应断言为具体配置结构体类型。
 //
 // 适用于：日志级别调整、缓存策略变更、连接池参数调优。
 //
 // 示例:
 //
-//	func (m *Manager) Configure(cfg any) error {
-//	    c, ok := cfg.(*LogConfig)
-//	    if !ok {
-//	        return fmt.Errorf("unexpected config type: %T", cfg)
-//	    }
-//	    m.setLevel(c.Level)
+//	type LogConfig struct {
+//	    Level string
+//	}
+//
+//	// Manager 实现 Configurable[LogConfig]
+//	func (m *Manager) Configure(cfg LogConfig) error {
+//	    m.setLevel(cfg.Level)
 //	    return nil
 //	}
-type Configurable interface {
-	Configure(cfg any) error
+type Configurable[T any] interface {
+	Configure(cfg T) error
 }
 
 // ServiceInfo 服务元信息契约。

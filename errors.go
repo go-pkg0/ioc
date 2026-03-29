@@ -19,6 +19,6 @@ var (
 	// ErrContainerClosed 容器已关闭后调用 Make 时返回。
 	ErrContainerClosed = errors.New("ioc: container is closed")
 
-	// ErrTypeMismatch MakeTyped 类型断言失败时返回。
+	// ErrTypeMismatch Make[T] 类型断言失败或 Decorate[T] 收到类型不匹配的实例时返回。
 	ErrTypeMismatch = errors.New("ioc: type mismatch")
 )

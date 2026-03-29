@@ -19,14 +19,14 @@ import "context"
 //
 //	func (p *LogServiceProvider) Register(c ioc.Container) error {
 //	    cfg := p.Config
-//	    c.Singleton("log", func(ctx context.Context, c ioc.Container) (any, error) {
+//	    ioc.Singleton(c, "log", func(ctx context.Context, c ioc.Container) (*log.Manager, error) {
 //	        return log.NewManager(cfg)
 //	    })
 //	    return nil
 //	}
 //
 //	func (p *LogServiceProvider) Boot(ctx context.Context, c ioc.Container) error {
-//	    mgr := ioc.MustMakeTyped[*log.Manager](ctx, c, "log")
+//	    mgr := ioc.MustMake[*log.Manager](ctx, c, "log")
 //	    log.SetDefault(mgr)
 //	    return nil
 //	}

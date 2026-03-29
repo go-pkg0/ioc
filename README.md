@@ -6,13 +6,14 @@ go-pkg0 生态的基础依赖注入框架，灵感来自 Laravel Service Contain
 
 ## 特性
 
-- **Container** — 服务绑定与解析（Bind / Singleton / Instance / Make），全链路 context.Context 传递
+- **泛型优先** — `Singleton[T]` / `Bind[T]` / `Make[T]` / `Decorate[T]` 编译期约束类型，消除 `any` 手动断言
+- **Container** — 服务绑定与解析，全链路 context.Context 传递
 - **别名系统** — `Alias(alias, abstract)` 支持链式别名解析（最大深度 10），同一服务可多名访问
 - **循环依赖检测** — 基于 context 的 per-goroutine 解析栈，Make 时自动检测并报告完整循环路径
-- **AOP** — 全局中间件（Middleware）+ 服务装饰器（Decorator），洋葱模型，支持链路追踪注入
+- **AOP** — 全局中间件（Middleware）+ 服务装饰器（`Decorate[T]`），洋葱模型，支持链路追踪注入
 - **ServiceProvider** — 两阶段生命周期（Register / Boot），支持延迟初始化 + `ProvidesAware` 内省
 - **DriverManager[T]** — 泛型多驱动管理器，延迟创建 + 缓存 + 优雅关闭，适配 db、cache、log 等多驱动场景
-- **服务契约** — Closeable / HealthChecker / Configurable / ServiceInfo
+- **服务契约** — Closeable / HealthChecker / `Configurable[T]` / ServiceInfo
 - **Application** — 轻量编排器，完整状态机（created→booting→booted→shutdown/failed），自动 Boot / Shutdown / HealthCheck
 - **生命周期管理** — Container 内置 Close（幂等）/ HealthCheck（并行），关闭后 Make 返回 `ErrContainerClosed`
 - **并发安全** — per-key `sync.Once` 保证单例工厂恰好执行一次，永久缓存错误避免竞态
@@ -41,13 +42,13 @@ func main() {
     c := ioc.New()
     ctx := context.Background()
 
-    // 注册单例
-    c.Singleton("greeting", func(ctx context.Context, c ioc.Container) (any, error) {
+    // 注册单例 — 工厂返回类型由编译器推断为 string
+    ioc.Singleton(c, "greeting", func(ctx context.Context, c ioc.Container) (string, error) {
         return "Hello, IoC!", nil
     })
 
-    // 解析（类型安全）
-    msg := ioc.MustMakeTyped[string](ctx, c, "greeting")
+    // 解析（类型安全，编译期检查）
+    msg := ioc.MustMake[string](ctx, c, "greeting")
     fmt.Println(msg) // Hello, IoC!
 }
 ```
@@ -58,7 +59,7 @@ func main() {
 type CacheServiceProvider struct{}
 
 func (p *CacheServiceProvider) Register(c ioc.Container) error {
-    c.Singleton("cache", func(ctx context.Context, c ioc.Container) (any, error) {
+    ioc.Singleton(c, "cache", func(ctx context.Context, c ioc.Container) (*RedisCache, error) {
         return NewRedisCache(ctx, "localhost:6379"), nil
     })
     return nil
@@ -89,8 +90,8 @@ if err := app.Boot(ctx); err != nil {
 }
 defer app.Shutdown(ctx) // 反序优雅关闭
 
-// 使用服务
-db := ioc.MustMakeTyped[*DatabaseManager](ctx, app.Container(), "db")
+// 使用服务（类型安全）
+db := ioc.MustMake[*DatabaseManager](ctx, app.Container(), "db")
 ```
 
 ### AOP — 装饰器 & 中间件
@@ -108,9 +109,8 @@ c.Use(func(abstract string, next ioc.ResolveFunc) ioc.ResolveFunc {
     }
 })
 
-// 服务装饰器：为特定服务添加监控
-c.Decorate("db", func(ctx context.Context, instance any, c ioc.Container) (any, error) {
-    pool := instance.(*ConnectionPool)
+// 类型安全装饰器：为特定服务添加监控（无需手动类型断言）
+ioc.Decorate(c, "db", func(ctx context.Context, pool *ConnectionPool, c ioc.Container) (*ConnectionPool, error) {
     return NewMonitoredPool(pool), nil
 })
 ```
@@ -145,6 +145,37 @@ mgr.Extend("redis", func(original CacheDriver) (CacheDriver, error) {
 defer mgr.Close(ctx)
 ```
 
+## 泛型 API（推荐）
+
+所有注册、解析、装饰操作均提供泛型函数，编译期约束类型，消除 `any`：
+
+```go
+// 注册 — 工厂返回类型由编译器推断
+ioc.Singleton(c, "db", func(ctx context.Context, c ioc.Container) (*sql.DB, error) { ... })
+ioc.Bind(c, "req", func(ctx context.Context, c ioc.Container) (*http.Request, error) { ... })
+ioc.Instance(c, "config", &AppConfig{Port: 8080})
+
+// 解析 — 返回具体类型，无需手动断言
+db, err := ioc.Make[*sql.DB](ctx, c, "db")
+db := ioc.MustMake[*sql.DB](ctx, c, "db")
+
+// 装饰 — 入参和返回均为具体类型
+ioc.Decorate(c, "db", func(ctx context.Context, db *sql.DB, c ioc.Container) (*sql.DB, error) {
+    return NewMonitoredDB(db), nil
+})
+```
+
+| 泛型函数 | 对应 Container 方法 | 说明 |
+|----------|---------------------|------|
+| `ioc.Singleton[T](c, name, factory)` | `c.Singleton(name, factory)` | 工厂返回 T，非 any |
+| `ioc.Bind[T](c, name, factory)` | `c.Bind(name, factory)` | 工厂返回 T，非 any |
+| `ioc.Instance[T](c, name, value)` | `c.Instance(name, value)` | value 类型为 T |
+| `ioc.Decorate[T](c, name, fn)` | `c.Decorate(name, decorator)` | fn 接收和返回 T |
+| `ioc.Make[T](ctx, c, name)` | `c.Make(ctx, name)` | 返回 T，非 any |
+| `ioc.MustMake[T](ctx, c, name)` | `c.MustMake(ctx, name)` | 返回 T，非 any |
+
+Container 接口方法为底层 API，仅在中间件、框架扩展等需要操作 `any` 的场景中直接使用。
+
 ## 核心接口
 
 ### Container
@@ -172,28 +203,18 @@ defer mgr.Close(ctx)
 |------|------|----------|
 | `Closeable` | 优雅关闭（Close 反序调用） | db、log、cache、es、mongo |
 | `HealthChecker` | 健康检查 | db、redis、es、mongo |
-| `Configurable` | 运行时配置热更新 | log、cache |
+| `Configurable[T]` | 运行时配置热更新（T 为具体配置类型） | log、cache |
 | `ServiceInfo` | 服务元信息 | 所有模块 |
-
-### 泛型助手
-
-```go
-// 类型安全解析
-val, err := ioc.MakeTyped[*MyService](ctx, container, "my-service")
-
-// 类型安全解析（失败 panic）
-val := ioc.MustMakeTyped[*MyService](ctx, container, "my-service")
-```
 
 ## 别名
 
 ```go
 c := ioc.New()
-c.Instance("database.mysql", mysqlConn)
+ioc.Instance(c, "database.mysql", mysqlConn)
 c.Alias("db", "database.mysql")      // db → database.mysql
 c.Alias("default-db", "db")          // default-db → db → database.mysql
 
-conn, err := c.Make(ctx, "default-db") // 自动链式解析
+conn, err := ioc.Make[*sql.DB](ctx, c, "default-db") // 自动链式解析
 ```
 
 ## 错误处理
@@ -207,16 +228,16 @@ conn, err := c.Make(ctx, "default-db") // 自动链式解析
 | `ErrDriverNotFound` | DriverManager 中驱动未注册 |
 | `ErrCircularDependency` | 检测到循环依赖（包含完整路径） |
 | `ErrContainerClosed` | 容器已关闭，拒绝新的 Make |
-| `ErrTypeMismatch` | `MakeTyped` 类型断言失败 |
+| `ErrTypeMismatch` | `Make[T]` / `Decorate[T]` 类型断言失败 |
 
 ### 单例错误缓存
 
 单例工厂返回的错误会被**永久缓存**，后续调用返回相同错误，避免并发竞态。如需重试：
 
 ```go
-c.Remove("svc")                    // 清除绑定和缓存
-c.Singleton("svc", newFactory)     // 重新注册
-val, err := c.Make(ctx, "svc")     // 重新解析
+c.Remove("svc")                                                        // 清除绑定和缓存
+ioc.Singleton(c, "svc", func(ctx context.Context, c ioc.Container) (T, error) { ... })  // 重新注册
+val, err := ioc.Make[T](ctx, c, "svc")                                // 重新解析
 ```
 
 ## 生态模块接入

@@ -36,7 +36,7 @@ type deferredProvider struct {
 
 func (p *deferredProvider) Register(c Container) error {
 	p.tracker.log = append(p.tracker.log, p.name+":register")
-	c.Singleton(p.name, func(_ context.Context, _ Container) (any, error) {
+	Singleton(c, p.name, func(_ context.Context, _ Container) (string, error) {
 		return "deferred-value", nil
 	})
 	return nil
@@ -177,9 +177,9 @@ func TestApplicationShutdownReverseOrder(t *testing.T) {
 	svc2 := &closeableService{name: "second"}
 	svc3 := &closeableService{name: "third"}
 
-	c.Instance("first", svc1)
-	c.Instance("second", svc2)
-	c.Instance("third", svc3)
+	Instance(c, "first", svc1)
+	Instance(c, "second", svc2)
+	Instance(c, "third", svc3)
 
 	err := app.Shutdown(ctx)
 	if err != nil {
@@ -196,8 +196,8 @@ func TestApplicationShutdownAggregatesErrors(t *testing.T) {
 	app := NewApp()
 	c := app.Container()
 
-	c.Instance("svc1", &closeableErrorService{name: "svc1"})
-	c.Instance("svc2", &closeableErrorService{name: "svc2"})
+	Instance(c, "svc1", &closeableErrorService{name: "svc1"})
+	Instance(c, "svc2", &closeableErrorService{name: "svc2"})
 
 	err := app.Shutdown(ctx)
 	if err == nil {
@@ -216,9 +216,9 @@ func TestApplicationHealthCheck(t *testing.T) {
 	app.Boot(ctx)
 	c := app.Container()
 
-	c.Instance("healthy", &healthyService{})
-	c.Instance("unhealthy", &unhealthyService{})
-	c.Instance("plain", "not-a-health-checker")
+	Instance(c, "healthy", &healthyService{})
+	Instance(c, "unhealthy", &unhealthyService{})
+	Instance(c, "plain", "not-a-health-checker")
 
 	result := app.HealthCheck(ctx)
 
@@ -244,14 +244,14 @@ func TestApplicationHealthCheckNotBooted(t *testing.T) {
 func TestApplicationWithContainer(t *testing.T) {
 	ctx := context.Background()
 	c := New()
-	c.Instance("existing", "value")
+	Instance(c, "existing", "value")
 
 	app := NewApp(WithContainer(c))
 	if app.Container() != c {
 		t.Fatal("should use provided container")
 	}
 
-	v, err := app.Container().Make(ctx, "existing")
+	v, err := Make[string](ctx, app.Container(), "existing")
 	if err != nil || v != "value" {
 		t.Fatal("should access existing bindings")
 	}
@@ -356,7 +356,7 @@ func TestApplicationShutdownFromFailed(t *testing.T) {
 	ctx := context.Background()
 	app := NewApp()
 	c := app.Container()
-	c.Instance("svc", &closeableService{name: "svc"})
+	Instance(c, "svc", &closeableService{name: "svc"})
 	app.Register(&errorProvider{phase: "boot"})
 
 	app.Boot(ctx) // fails
