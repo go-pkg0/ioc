@@ -32,7 +32,6 @@ func TestDriverManagerBasic(t *testing.T) {
 		return &testDriver{name: "secondary"}, nil
 	})
 
-	// Default
 	d, err := mgr.Default(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +40,6 @@ func TestDriverManagerBasic(t *testing.T) {
 		t.Fatalf("expected primary, got %s", d.Name())
 	}
 
-	// By name
 	d2, err := mgr.Driver(ctx, "secondary")
 	if err != nil {
 		t.Fatal(err)
@@ -106,7 +104,6 @@ func TestDriverManagerExtend(t *testing.T) {
 		return &testDriver{name: "default"}, nil
 	})
 
-	// Extend 装饰已有驱动
 	mgr.Extend("default", func(original *testDriver) (*testDriver, error) {
 		return &testDriver{name: original.name + "+extended"}, nil
 	})
@@ -202,7 +199,6 @@ func TestDriverManagerFactoryError(t *testing.T) {
 		t.Fatal("expected error")
 	}
 
-	// 错误被永久缓存，不会重新执行工厂
 	_, err = mgr.Default(ctx)
 	if err == nil {
 		t.Fatal("expected cached error")
@@ -223,7 +219,6 @@ func TestDriverManagerClose(t *testing.T) {
 		return &testDriver{name: "b"}, nil
 	})
 
-	// 只创建 a，b 未使用
 	dA, _ := mgr.Driver(ctx, "a")
 
 	err := mgr.Close(ctx)

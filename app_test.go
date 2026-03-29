@@ -49,15 +49,28 @@ func (p *deferredProvider) Boot(_ context.Context, c Container) error {
 
 func (p *deferredProvider) Deferred() bool { return true }
 
+// --- 测试用 ProvidesAware DeferrableProvider ---
+
+type providesAwareProvider struct {
+	deferredProvider
+	provides []string
+}
+
+func (p *providesAwareProvider) Provides() []string { return p.provides }
+
 // --- 测试用 Closeable ---
 
 type closeableService struct {
-	name   string
-	closed bool
+	name    string
+	closed  bool
+	onClose func()
 }
 
 func (s *closeableService) Close(_ context.Context) error {
 	s.closed = true
+	if s.onClose != nil {
+		s.onClose()
+	}
 	return nil
 }
 
@@ -138,14 +151,12 @@ func TestApplicationDeferrableProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// DeferrableProvider 的 Boot 不应被调用
 	for _, e := range tracker.log {
 		if e == "es:boot" {
 			t.Fatal("deferred provider's Boot should not be called")
 		}
 	}
 
-	// 但 Register 应该被调用
 	found := false
 	for _, e := range tracker.log {
 		if e == "es:register" {
@@ -192,7 +203,6 @@ func TestApplicationShutdownAggregatesErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected aggregated error")
 	}
-	// errors.Join 的结果应包含两个错误信息
 	errMsg := err.Error()
 	if len(errMsg) == 0 {
 		t.Fatal("error message should not be empty")
@@ -202,6 +212,8 @@ func TestApplicationShutdownAggregatesErrors(t *testing.T) {
 func TestApplicationHealthCheck(t *testing.T) {
 	ctx := context.Background()
 	app := NewApp()
+	app.Register(&trackingProvider{name: "init", tracker: &orderTracker{}})
+	app.Boot(ctx)
 	c := app.Container()
 
 	c.Instance("healthy", &healthyService{})
@@ -210,7 +222,6 @@ func TestApplicationHealthCheck(t *testing.T) {
 
 	result := app.HealthCheck(ctx)
 
-	// 只有实现 HealthChecker 的服务才会被检查
 	if len(result) != 2 {
 		t.Fatalf("expected 2 health checks, got %d", len(result))
 	}
@@ -219,6 +230,14 @@ func TestApplicationHealthCheck(t *testing.T) {
 	}
 	if result["unhealthy"] == nil {
 		t.Fatal("unhealthy service should return error")
+	}
+}
+
+func TestApplicationHealthCheckNotBooted(t *testing.T) {
+	app := NewApp()
+	result := app.HealthCheck(context.Background())
+	if result != nil {
+		t.Fatal("HealthCheck before boot should return nil")
 	}
 }
 
@@ -276,4 +295,122 @@ func (p *errorProvider) Boot(_ context.Context, c Container) error {
 		return errors.New("boot failed")
 	}
 	return nil
+}
+
+// --- P1: Application 状态机 ---
+
+func TestApplicationRegisterAfterBootPanics(t *testing.T) {
+	ctx := context.Background()
+	app := NewApp()
+	app.Boot(ctx)
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("Register after Boot should panic")
+		}
+	}()
+
+	app.Register(&trackingProvider{name: "late", tracker: &orderTracker{}})
+}
+
+func TestApplicationBootAfterFailReturnsError(t *testing.T) {
+	ctx := context.Background()
+	app := NewApp()
+	app.Register(&errorProvider{phase: "boot"})
+
+	err := app.Boot(ctx)
+	if err == nil {
+		t.Fatal("expected boot error")
+	}
+
+	// 重试 Boot 应返回错误（failed 状态）
+	err = app.Boot(ctx)
+	if err == nil {
+		t.Fatal("Boot retry after failure should return error")
+	}
+}
+
+func TestApplicationShutdownFromCreated(t *testing.T) {
+	app := NewApp()
+	err := app.Shutdown(context.Background())
+	if err != nil {
+		t.Fatalf("Shutdown from created state should succeed, got %v", err)
+	}
+}
+
+func TestApplicationShutdownIdempotent(t *testing.T) {
+	ctx := context.Background()
+	app := NewApp()
+	app.Boot(ctx)
+
+	if err := app.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// 第二次应为 no-op
+	if err := app.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestApplicationShutdownFromFailed(t *testing.T) {
+	ctx := context.Background()
+	app := NewApp()
+	c := app.Container()
+	c.Instance("svc", &closeableService{name: "svc"})
+	app.Register(&errorProvider{phase: "boot"})
+
+	app.Boot(ctx) // fails
+
+	// Shutdown from failed state should still close resources
+	err := app.Shutdown(ctx)
+	if err != nil {
+		t.Fatalf("Shutdown from failed state should succeed, got %v", err)
+	}
+}
+
+func TestApplicationBootAfterShutdownFails(t *testing.T) {
+	ctx := context.Background()
+	app := NewApp()
+	app.Boot(ctx)
+	app.Shutdown(ctx)
+
+	err := app.Boot(ctx)
+	if err == nil {
+		t.Fatal("Boot after Shutdown should fail")
+	}
+}
+
+func TestApplicationBooted(t *testing.T) {
+	app := NewApp()
+	if app.Booted() {
+		t.Fatal("should not be booted initially")
+	}
+
+	app.Boot(context.Background())
+	if !app.Booted() {
+		t.Fatal("should be booted after Boot")
+	}
+
+	app.Shutdown(context.Background())
+	if app.Booted() {
+		t.Fatal("should not be booted after Shutdown")
+	}
+}
+
+// --- P2: ProvidesAware ---
+
+func TestProvidesAwareInterface(t *testing.T) {
+	tracker := &orderTracker{}
+	p := &providesAwareProvider{
+		deferredProvider: deferredProvider{name: "es", tracker: tracker},
+		provides:         []string{"es", "es.client"},
+	}
+
+	names := p.Provides()
+	if len(names) != 2 {
+		t.Fatalf("expected 2 provides, got %d", len(names))
+	}
+	if !p.Deferred() {
+		t.Fatal("should be deferred")
+	}
 }
