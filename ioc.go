@@ -16,8 +16,8 @@ var _ Container = (*container)(nil)
 type resolveStackKey struct{}
 
 // singletonEntry 使用 sync.Once 保证单例工厂仅执行一次。
-// 工厂错误会被永久缓存，避免并发重试导致的竞态问题。
-// 如需重试，请调用 Remove 后重新注册。
+// 若工厂失败，entry 会从 pending 中移除，允许后续调用者重试。
+// 若工厂成功，结果提升到 singletons 缓存（快路径）。
 type singletonEntry struct {
 	once sync.Once
 	val  any
@@ -30,7 +30,7 @@ type container struct {
 	mu          sync.RWMutex
 	bindings    map[string]binding
 	singletons  map[string]any             // 已就绪的单例缓存
-	pending     map[string]*singletonEntry // 正在创建或已失败的单例
+	pending     map[string]*singletonEntry // 正在创建的单例
 	order       []string                   // 单例创建顺序（Close 反序关闭用）
 	decorators  map[string][]Decorator     // 服务级装饰器
 	middlewares []Middleware               // 全局中间件
@@ -48,15 +48,26 @@ func New() Container {
 	}
 }
 
+// panicIfClosed 检查容器是否已关闭（编程错误时 panic）。
+func (c *container) panicIfClosed(op string) {
+	if c.closed.Load() {
+		panic(fmt.Sprintf("ioc: %s on closed container", op))
+	}
+}
+
 // Bind 注册瞬时工厂。
+// 容器关闭后调用 panic（编程错误）。
 func (c *container) Bind(abstract string, factory Factory) {
+	c.panicIfClosed("Bind")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.bindings[abstract] = binding{factory: factory, singleton: false}
 }
 
 // Singleton 注册单例工厂。
+// 容器关闭后调用 panic（编程错误）。
 func (c *container) Singleton(abstract string, factory Factory) {
+	c.panicIfClosed("Singleton")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.removeFromOrder(abstract)
@@ -67,7 +78,9 @@ func (c *container) Singleton(abstract string, factory Factory) {
 }
 
 // Instance 直接注册已构建的实例为单例。
+// 容器关闭后调用 panic（编程错误）。
 func (c *container) Instance(abstract string, value any) {
+	c.panicIfClosed("Instance")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.removeFromOrder(abstract)
@@ -77,7 +90,9 @@ func (c *container) Instance(abstract string, value any) {
 }
 
 // Alias 为已注册的服务创建别名。
+// 容器关闭后调用 panic（编程错误）。
 func (c *container) Alias(alias, abstract string) {
+	c.panicIfClosed("Alias")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.aliases[alias] = abstract
@@ -144,6 +159,11 @@ func (c *container) Make(ctx context.Context, abstract string) (any, error) {
 
 	// 单例路径：使用 per-key sync.Once 保证工厂仅执行一次。
 	c.mu.Lock()
+	// 关闭保护：在写锁内检查 closed，防止 Close 快照后创建新单例。
+	if c.closed.Load() {
+		c.mu.Unlock()
+		return nil, ErrContainerClosed
+	}
 	// 二次检查：可能在等待锁期间已被其他 goroutine 创建。
 	if val, ok := c.singletons[abstract]; ok {
 		c.mu.Unlock()
@@ -161,15 +181,28 @@ func (c *container) Make(ctx context.Context, abstract string) (any, error) {
 		entry.val, entry.err = resolve(ctx)
 	})
 
-	// 工厂错误被永久缓存在 pending 中，后续调用返回相同错误。
-	// 成功的结果会提升到 singletons 缓存并从 pending 中移除。
-	// 如需重试错误，调用 Remove 后重新 Singleton 注册。
+	// 工厂失败：清除 pending entry，允许后续调用者用新 context 重试。
+	// 等待同一 Once 的 goroutine 都会收到相同错误。
 	if entry.err != nil {
+		c.mu.Lock()
+		if cur, ok := c.pending[abstract]; ok && cur == entry {
+			delete(c.pending, abstract)
+		}
+		c.mu.Unlock()
 		return nil, entry.err
 	}
 
 	// 将结果提升到 singletons 缓存（快路径）。
 	c.mu.Lock()
+	// 二次关闭保护：若工厂执行期间容器被关闭，清理新实例，避免泄漏。
+	if c.closed.Load() {
+		delete(c.pending, abstract)
+		c.mu.Unlock()
+		if closeable, ok := entry.val.(Closeable); ok {
+			_ = closeable.Close(ctx)
+		}
+		return nil, ErrContainerClosed
+	}
 	if _, ok := c.singletons[abstract]; !ok {
 		c.singletons[abstract] = entry.val
 		c.order = append(c.order, abstract)
@@ -199,14 +232,18 @@ func (c *container) Has(abstract string) bool {
 }
 
 // Decorate 为指定服务添加装饰器。
+// 容器关闭后调用 panic（编程错误）。
 func (c *container) Decorate(abstract string, decorator Decorator) {
+	c.panicIfClosed("Decorate")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.decorators[abstract] = append(c.decorators[abstract], decorator)
 }
 
 // Use 注册全局中间件。
+// 容器关闭后调用 panic（编程错误）。
 func (c *container) Use(middleware ...Middleware) {
+	c.panicIfClosed("Use")
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.middlewares = append(c.middlewares, middleware...)

@@ -21,4 +21,7 @@ var (
 
 	// ErrTypeMismatch Make[T] 类型断言失败或 Decorate[T] 收到类型不匹配的实例时返回。
 	ErrTypeMismatch = errors.New("ioc: type mismatch")
+
+	// ErrDriverManagerClosed DriverManager 已关闭后调用 Driver 时返回。
+	ErrDriverManagerClosed = errors.New("ioc: driver manager is closed")
 )

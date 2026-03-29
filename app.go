@@ -138,22 +138,31 @@ func (a *Application) Boot(ctx context.Context) error {
 // Shutdown 优雅关闭：委托给 Container.Close。
 // 幂等：从 shutdown 状态调用返回 nil。
 // 允许从 created/booted/failed 状态调用。
+// Close 在锁外执行，避免长时间持锁阻塞 HealthCheck/Booted 等方法。
 func (a *Application) Shutdown(ctx context.Context) error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 
 	switch a.state {
 	case appShutdown:
+		a.mu.Unlock()
 		return nil // 幂等
 	case appShuttingDown:
+		a.mu.Unlock()
 		return fmt.Errorf("ioc: shutdown already in progress")
 	case appBooting:
+		a.mu.Unlock()
 		return fmt.Errorf("ioc: cannot shutdown during boot")
 	}
 
 	a.state = appShuttingDown
+	a.mu.Unlock()
+
+	// 在锁外执行 Close，避免长时间持锁阻塞 HealthCheck/Booted 等方法。
 	err := a.container.Close(ctx)
+
+	a.mu.Lock()
 	a.state = appShutdown
+	a.mu.Unlock()
 	return err
 }
 

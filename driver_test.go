@@ -199,13 +199,87 @@ func TestDriverManagerFactoryError(t *testing.T) {
 		t.Fatal("expected error")
 	}
 
+	// 工厂失败后允许重试
 	_, err = mgr.Default(ctx)
 	if err == nil {
-		t.Fatal("expected cached error")
+		t.Fatal("expected error on retry")
 	}
-	if callCount != 1 {
-		t.Fatalf("factory should be called exactly once (error cached), got %d", callCount)
+	if callCount != 2 {
+		t.Fatalf("factory should be retried on failure, got %d calls", callCount)
 	}
+}
+
+func TestDriverManagerFactoryRetryOnTransientError(t *testing.T) {
+	ctx := context.Background()
+	mgr := NewDriverManager[*testDriver]("default")
+
+	callCount := 0
+	mgr.Register("default", func(_ context.Context) (*testDriver, error) {
+		callCount++
+		if callCount == 1 {
+			return nil, errors.New("transient error")
+		}
+		return &testDriver{name: "default"}, nil
+	})
+
+	_, err := mgr.Default(ctx)
+	if err == nil {
+		t.Fatal("expected error on first call")
+	}
+
+	d, err := mgr.Default(ctx)
+	if err != nil {
+		t.Fatalf("expected success on retry, got %v", err)
+	}
+	if d.Name() != "default" {
+		t.Fatalf("expected 'default', got %s", d.Name())
+	}
+}
+
+func TestDriverManagerClosedBlocks(t *testing.T) {
+	ctx := context.Background()
+	mgr := NewDriverManager[*testDriver]("default")
+	mgr.Register("default", func(_ context.Context) (*testDriver, error) {
+		return &testDriver{name: "default"}, nil
+	})
+
+	mgr.Close(ctx)
+
+	_, err := mgr.Driver(ctx, "default")
+	if !errors.Is(err, ErrDriverManagerClosed) {
+		t.Fatalf("expected ErrDriverManagerClosed, got %v", err)
+	}
+}
+
+func TestDriverManagerCloseIdempotent(t *testing.T) {
+	ctx := context.Background()
+	mgr := NewDriverManager[*testDriver]("default")
+	mgr.Register("default", func(_ context.Context) (*testDriver, error) {
+		return &testDriver{name: "default"}, nil
+	})
+	mgr.Driver(ctx, "default")
+
+	if err := mgr.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Close(ctx); err != nil {
+		t.Fatal("second Close should be idempotent")
+	}
+}
+
+func TestDriverManagerRegisterAfterClosePanics(t *testing.T) {
+	ctx := context.Background()
+	mgr := NewDriverManager[*testDriver]("default")
+	mgr.Close(ctx)
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("Register on closed DriverManager should panic")
+		}
+	}()
+	mgr.Register("x", func(_ context.Context) (*testDriver, error) {
+		return &testDriver{name: "x"}, nil
+	})
 }
 
 func TestDriverManagerClose(t *testing.T) {
