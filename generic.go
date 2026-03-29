@@ -1,15 +1,18 @@
 package ioc
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // MakeTyped 解析服务实例并断言为目标类型 T。
 // 解析失败或类型不匹配时返回 T 的零值和错误。
 //
 // 示例:
 //
-//	mgr, err := ioc.MakeTyped[*log.Manager](c, "log")
-func MakeTyped[T any](c Container, abstract string) (T, error) {
-	val, err := c.Make(abstract)
+//	mgr, err := ioc.MakeTyped[*log.Manager](ctx, c, "log")
+func MakeTyped[T any](ctx context.Context, c Container, abstract string) (T, error) {
+	val, err := c.Make(ctx, abstract)
 	if err != nil {
 		var zero T
 		return zero, err
@@ -27,9 +30,9 @@ func MakeTyped[T any](c Container, abstract string) (T, error) {
 //
 // 示例:
 //
-//	mgr := ioc.MustMakeTyped[*log.Manager](c, "log")
-func MustMakeTyped[T any](c Container, abstract string) T {
-	v, err := MakeTyped[T](c, abstract)
+//	mgr := ioc.MustMakeTyped[*log.Manager](ctx, c, "log")
+func MustMakeTyped[T any](ctx context.Context, c Container, abstract string) T {
+	v, err := MakeTyped[T](ctx, c, abstract)
 	if err != nil {
 		panic(err)
 	}
