@@ -191,13 +191,13 @@ func TestMakeFactoryError(t *testing.T) {
 		t.Fatalf("expected factory error, got %v", err)
 	}
 
-	// 工厂错误被永久缓存，不会重新执行工厂
+	// 工厂失败后允许重试：后续调用会重新执行工厂
 	_, err = Make[string](ctx, c, "svc")
 	if !errors.Is(err, expectedErr) {
-		t.Fatalf("expected cached factory error, got %v", err)
+		t.Fatalf("expected factory error on retry, got %v", err)
 	}
-	if callCount != 1 {
-		t.Fatalf("factory should be called exactly once (error cached), got %d", callCount)
+	if callCount != 2 {
+		t.Fatalf("factory should be retried on failure, got %d calls", callCount)
 	}
 }
 
@@ -698,6 +698,75 @@ func TestHealthCheckPanicRecovery(t *testing.T) {
 	}
 	if result["panicker"] == nil {
 		t.Fatal("panicking service should return error")
+	}
+}
+
+func TestOperationsOnClosedContainerPanic(t *testing.T) {
+	ops := map[string]func(Container){
+		"Bind": func(c Container) {
+			c.Bind("x", func(_ context.Context, _ Container) (any, error) { return nil, nil })
+		},
+		"Singleton": func(c Container) {
+			c.Singleton("x", func(_ context.Context, _ Container) (any, error) { return nil, nil })
+		},
+		"Instance": func(c Container) {
+			c.Instance("x", "val")
+		},
+		"Alias": func(c Container) {
+			c.Alias("x", "y")
+		},
+		"Decorate": func(c Container) {
+			c.Decorate("x", func(_ context.Context, v any, _ Container) (any, error) { return v, nil })
+		},
+		"Use": func(c Container) {
+			c.Use(func(_ string, next ResolveFunc) ResolveFunc { return next })
+		},
+	}
+
+	for name, op := range ops {
+		t.Run(name, func(t *testing.T) {
+			c := New()
+			c.Close(context.Background())
+
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("%s on closed container should panic", name)
+				}
+			}()
+			op(c)
+		})
+	}
+}
+
+func TestSingletonFactoryRetryOnTransientError(t *testing.T) {
+	c := New()
+	ctx := context.Background()
+
+	callCount := 0
+	Singleton(c, "svc", func(_ context.Context, _ Container) (string, error) {
+		callCount++
+		if callCount == 1 {
+			return "", errors.New("transient error")
+		}
+		return "success", nil
+	})
+
+	// 首次调用失败
+	_, err := Make[string](ctx, c, "svc")
+	if err == nil {
+		t.Fatal("expected error on first call")
+	}
+
+	// 重试应成功
+	v, err := Make[string](ctx, c, "svc")
+	if err != nil {
+		t.Fatalf("expected success on retry, got %v", err)
+	}
+	if v != "success" {
+		t.Fatalf("expected 'success', got %q", v)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected 2 factory calls, got %d", callCount)
 	}
 }
 
